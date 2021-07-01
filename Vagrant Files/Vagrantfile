@@ -1,0 +1,118 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+
+#installing required plugins if not already installed.
+if ARGV[0] != 'plugin'
+  
+  required_plugins = ['vagrant-hostmanager', 'vagrant-reload'
+  ]
+  plugins_to_install = required_plugins.select { |plugin| not Vagrant.has_plugin? plugin }
+  if not plugins_to_install.empty?
+    puts "Installing plugins: #{plugins_to_install.join(' ')}"
+      if system "vagrant plugin install #{plugins_to_install.join(' ')}"
+        exec "vagrant #{ARGV.join(' ')}"
+      else
+        abort "Installation of one or more plugins has failed. Aborting."
+      end
+
+  end
+end
+
+
+
+$initScript = <<-SCRIPT
+
+  #check if user petclinic exist, if not, add it.
+  id -u petclinic &>/dev/null || sudo useradd -s /bin/bash -d /home/petclinic/ -m -p $(openssl passwd -1 12345678) -G sudo petclinic 
+	
+  #switch to petclinic user
+  sudo su - petclinic
+  
+  #change user directory
+  cd /home/petclinic
+
+  #running java.sh script
+  /vagrant/java.sh
+SCRIPT
+
+
+$systemd = <<-SCRIPT
+#creating systemd unit file for petclinic service
+
+cat > /etc/systemd/system/petclinic.service <<EOF
+
+[Unit]
+
+Description=Petclinic Java Spring Boot
+
+[Service]
+
+User=petclinic
+
+#setting environment variables for petclinic to use when connecting to database
+EnvironmentFile=/home/petclinic/pet.env
+
+#command for running the .jar file(starting petclinic app)
+ExecStart=/bin/java -Dspring.profiles.active=mysql -jar /home/petclinic/petclinic.jar
+
+[Install]
+
+WantedBy=multi-user.target
+
+EOF
+
+#enable and start the petclinic service
+  sudo systemctl daemon-reload
+  sudo systemctl enable petclinic.service
+  sudo systemctl restart petclinic
+
+SCRIPT
+
+
+Vagrant.configure("2") do |config|
+  #setting up shared folder
+  config.vm.synced_folder ".", "/vagrant"
+  config.vm.boot_timeout = 1800
+  #hostmanager settings
+  config.hostmanager.enabled = true
+  config.hostmanager.manage_host = true
+  config.hostmanager.ignore_private_ip = false
+  config.hostmanager.include_offline = true
+
+  config.vm.define :DB_VM do |db|
+       db.vm.box = "ubuntu/focal64"
+       db.vm.hostname = "db"
+       #after the box is up, following provisioning scripts will run
+       #setting environment variables for db machine
+       db.vm.provision :shell, inline: "echo 'source /vagrant/env.sh' > /etc/profile.d/env.sh", :run => 'always'
+       db.vm.provision :shell, path: "db.sh"
+       db.vm.provision :shell, path: "check-mysql.sh"
+       db.vm.network :private_network, ip: "192.168.1.2"
+       #customize resources allocated for the box 
+       db.vm.provider "virtualbox" do |vb|
+          vb.name = "DB_VM"
+          vb.memory = "4096"
+          vb.cpus = "4"
+       end
+  end 
+
+  config.vm.define :APP_VM do |app| 
+        app.vm.box = "ubuntu/focal64"
+	app.vm.hostname = "app" 
+	#after the box is up, following provisioning scripts will run
+	app.vm.provision "shell", inline: $initScript
+	#creating env file for petclinic service to use
+	app.vm.provision :shell, inline: "cat /vagrant/env.sh | awk '{print $2}' > /home/petclinic/pet.env"
+        app.vm.provision "shell", inline: $systemd
+	app.vm.provision :shell, path: "check-app.sh"
+        app.vm.network :private_network, ip: "192.168.1.3"
+	app.vm.network "forwarded_port", guest: 8080, host: 8000
+        #customize resources allocated for the box 
+        app.vm.provider "virtualbox" do |vb|
+            vb.name = "APP_VM"
+            vb.memory = "4096"
+            vb.cpus = "4"
+        end
+  end
+
+end
